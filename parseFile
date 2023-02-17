@@ -1,0 +1,483 @@
+import { BadRequestException, HttpStatus, Injectable } from '@nestjs/common'
+import { InjectRepository } from '@nestjs/typeorm'
+import { Import } from './entities/import.entity'
+import { Repository } from 'typeorm'
+import { AmocrmService } from '../amocrm/amocrm.service'
+import { AccountsService } from '../../../backendpanel/src/accounts/accounts.service'
+import { CustomFieldHelper } from './helpers/custom-field.helper'
+import { ParseFileHelper } from './helpers/parse-file.helper'
+
+@Injectable()
+export class ParseFileService {
+    constructor(
+        private readonly amocrmService: AmocrmService,
+        private readonly accountService: AccountsService,
+        private readonly parseHelper: ParseFileHelper
+    ) {}
+
+    async createAmoEntities(currentImport: Import) {
+        const account = await this.accountService.findOneById(currentImport.account_id)
+        if (!account) {
+            throw new Error('Could not find an account')
+        }
+
+        const install = await account.installs.find((ins) => ins.product_sysname === 'import')
+        if (!install) {
+            throw new Error('Could not find an install')
+        }
+
+        /** Проверяем и обновляем amo access token */
+        const oauthToken = await this.amocrmService.checkAndUpdateAccessToken(install)
+        const amo = await this.amocrmService.setAmoClient(oauthToken, account)
+
+        const customFields = await this.amocrmService.getAllCustomFields(amo)
+        const users = await this.amocrmService.getAllUsers(amo)
+        const settings = currentImport.settings
+        const matching = currentImport.matching
+
+        const fieldsFromFileSheets = await this.parseFile(currentImport)
+
+        // объявляем массивы сущностей
+        const leads = [],
+            contacts = [],
+            companies = []
+        let tags
+
+        if (settings.tag) {
+            tags = {
+                tags: [
+                    {
+                        name: settings.tag,
+                    },
+                ],
+            }
+        }
+
+        // цикл по страницам файла
+        for (const sheet in fieldsFromFileSheets) {
+            const fieldsFromFile = fieldsFromFileSheets[sheet]
+
+            // цикл по строкам файла
+            for (const row in fieldsFromFile) {
+                if (!fieldsFromFile[row]) {
+                    break
+                }
+
+                // Убираем первую строку если в настройках insertFirst = false
+                if (!settings.insertFirst && row === '0') {
+                    continue
+                }
+
+                //цикл по карте сопоставлений
+                for (const field in matching) {
+                    if (
+                        !matching[field] ||
+                        matching[field] === 'null' ||
+                        matching[field] === '' ||
+                        matching[field] === ' '
+                    ) {
+                        continue
+                    }
+
+                    const matchField = matching[field].split('.')
+                    const fieldType = matchField[0] ? matchField[0] : null
+                    const fieldId = matchField[1] ? matchField[1] : null
+
+                    if (!fieldId) {
+                        continue
+                    }
+
+                    const currentFieldObj = {}
+
+                    // Сопоставляеми обычные поля сущностей
+                    if (fieldId === 'company_name') {
+                        if (fieldsFromFile[row][field]) {
+                            currentFieldObj['name'] = fieldsFromFile[row][field]
+                            if (companies[row]) {
+                                companies[row]['name'] = currentFieldObj['name']
+                            } else {
+                                companies[row] = currentFieldObj
+                            }
+                        }
+
+                        continue
+                    }
+
+                    if (fieldId === 'company_responsible_id') {
+                        if (fieldsFromFile[row][field]) {
+                            currentFieldObj['responsible_user_id'] =
+                                this.parseHelper.getResponsibleId(
+                                    String(fieldsFromFile[row][field]),
+                                    users
+                                )
+                            if (companies[row]) {
+                                companies[row]['responsible_user_id'] =
+                                    currentFieldObj['responsible_user_id']
+                            } else {
+                                companies[row] = currentFieldObj
+                            }
+                        }
+
+                        continue
+                    }
+
+                    if (fieldId === 'contact_name') {
+                        if (fieldsFromFile[row][field]) {
+                            currentFieldObj['name'] = fieldsFromFile[row][field]
+                            if (contacts[row]) {
+                                contacts[row]['name'] = currentFieldObj['name']
+                            } else {
+                                contacts[row] = currentFieldObj
+                            }
+                        }
+
+                        continue
+                    }
+
+                    if (fieldId === 'contact_responsible_id') {
+                        if (fieldsFromFile[row][field]) {
+                            currentFieldObj['responsible_user_id'] =
+                                this.parseHelper.getResponsibleId(
+                                    String(fieldsFromFile[row][field]),
+                                    users
+                                )
+                            if (contacts[row]) {
+                                contacts[row]['responsible_user_id'] =
+                                    currentFieldObj['responsible_user_id']
+                            } else {
+                                contacts[row] = currentFieldObj
+                            }
+                        }
+
+                        continue
+                    }
+
+                    if (fieldId === 'lead_name') {
+                        if (fieldsFromFile[row][field]) {
+                            currentFieldObj['name'] = fieldsFromFile[row][field]
+                            if (leads[row]) {
+                                leads[row]['name'] = currentFieldObj['name']
+                            } else {
+                                leads[row] = currentFieldObj
+                            }
+                        }
+
+                        continue
+                    }
+
+                    if (fieldId === 'lead_price') {
+                        if (fieldsFromFile[row][field]) {
+                            currentFieldObj['price'] = fieldsFromFile[row][field]
+                            if (leads[row]) {
+                                leads[row]['price'] = currentFieldObj['price']
+                            } else {
+                                leads[row] = currentFieldObj
+                            }
+                        }
+
+                        continue
+                    }
+
+                    if (fieldId === 'lead_responsible_id') {
+                        if (fieldsFromFile[row][field]) {
+                            currentFieldObj['responsible_user_id'] =
+                                this.parseHelper.getResponsibleId(
+                                    String(fieldsFromFile[row][field]),
+                                    users
+                                )
+                            if (leads[row]) {
+                                leads[row]['responsible_user_id'] =
+                                    currentFieldObj['responsible_user_id']
+                            } else {
+                                leads[row] = currentFieldObj
+                            }
+                        }
+
+                        continue
+                    }
+
+                    // если наша сущность существует в массиве кастомных полей ['leads' => [], 'contacts' => [], 'companies' => []]
+                    if (customFields[fieldType]) {
+                        // цикл по полям сущности
+                        for (const customField in customFields[fieldType]) {
+                            // если id сущности амо и из карты сопоставлений равны
+                            if (
+                                Number(customFields[fieldType][customField]['id']) ===
+                                Number(fieldId)
+                            ) {
+                                // получаем значение на пересечении столбца и строки
+                                const value = fieldsFromFile[row][field]
+                                    ? fieldsFromFile[row][field]
+                                    : null
+                                const currentField = CustomFieldHelper.generateField(
+                                    customFields[fieldType][customField],
+                                    value
+                                )
+
+                                //currentFieldObj.custom_fields_values.push(currentField)
+                                if (currentFieldObj['custom_fields_values']) {
+                                    currentFieldObj['custom_fields_values'].push(currentField)
+                                } else {
+                                    currentFieldObj['custom_fields_values'] = [currentField]
+                                }
+
+                                // собираем кастомные поля, пихаем по трем массивам leads, contacts, companies
+                                if (fieldType === 'leads' && currentField) {
+                                    if (leads[row]) {
+                                        if (leads[row]['custom_fields_values']) {
+                                            leads[row]['custom_fields_values'].push(currentField)
+                                        } else {
+                                            leads[row]['custom_fields_values'] = [currentField]
+                                        }
+                                    } else {
+                                        leads[row] = currentFieldObj
+                                    }
+
+                                    break
+                                }
+
+                                if (fieldType === 'contacts' && currentField) {
+                                    if (contacts[row]) {
+                                        if (contacts[row]['custom_fields_values']) {
+                                            contacts[row]['custom_fields_values'].push(currentField)
+                                        } else {
+                                            contacts[row]['custom_fields_values'] = [currentField]
+                                        }
+                                    } else {
+                                        contacts[row] = currentFieldObj
+                                    }
+
+                                    break
+                                }
+
+                                if (fieldType === 'companies' && currentField) {
+                                    if (companies[row]) {
+                                        if (companies[row]['custom_fields_values']) {
+                                            companies[row]['custom_fields_values'].push(
+                                                currentField
+                                            )
+                                        } else {
+                                            companies[row]['custom_fields_values'] = [currentField]
+                                        }
+                                    } else {
+                                        companies[row] = currentFieldObj
+                                    }
+
+                                    break
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Добавляем к сущностям теги и request_id, который содержит в себе номер строки,
+                // нужен дальше для того чтобы понимать к какой строке принадлежала добавленная сущность
+                if (leads[row]) {
+                    leads[row]['request_id'] = row
+
+                    if (settings.status_id || settings.status_id !== null) {
+                        leads[row]['status_id'] = Number(settings.status_id)
+                    }
+
+                    if (!leads[row]['responsible_user_id']) {
+                        if (settings.responsible_id) {
+                            leads[row]['responsible_user_id'] = Number(settings.responsible_id)
+                        }
+                    }
+
+                    if (tags) {
+                        leads[row]['_embedded'] = tags
+                    }
+                }
+
+                if (companies[row]) {
+                    companies[row]['request_id'] = row
+
+                    if (!companies[row]['responsible_user_id']) {
+                        if (settings.responsible_id) {
+                            companies[row]['responsible_user_id'] = Number(settings.responsible_id)
+                        }
+                    }
+
+                    if (tags) {
+                        companies[row]['_embedded'] = tags
+                    }
+                }
+
+                if (contacts[row]) {
+                    contacts[row]['request_id'] = row
+                    if (!contacts[row]['responsible_user_id']) {
+                        if (settings.responsible_id) {
+                            contacts[row]['responsible_user_id'] = Number(settings.responsible_id)
+                        }
+                    }
+
+                    if (tags) {
+                        contacts[row]['_embedded'] = tags
+                    }
+                }
+            }
+        }
+
+        let doubleFieldTypeCompanies = ''
+        let doubleFieldCompaniesId = ''
+
+        let doubleFieldTypeContacts = ''
+        let doubleFieldContactsId = ''
+
+        if (settings.doubleFields) {
+            for (const doubleField in settings.doubleFields) {
+                if (!settings.doubleFields[doubleField]) {
+                    continue
+                }
+
+                const doubleFieldType = doubleField
+                const doubleFieldId = settings.doubleFields[doubleField]
+                    ? settings.doubleFields[doubleField]
+                    : null
+
+                if (doubleFieldType === 'companies') {
+                    doubleFieldTypeCompanies = 'companies'
+                    doubleFieldCompaniesId = doubleFieldId
+                }
+
+                if (doubleFieldType === 'contacts') {
+                    doubleFieldTypeContacts = 'contacts'
+                    doubleFieldContactsId = doubleFieldId
+                }
+            }
+        }
+
+        // методы updateOrCreateContacts и updateOrCreateCompanies практически идентичны, не стал все оптимизировать и запихивать в один метод
+        // так как возможно дальнейшее расширение каждого из методов, которые могут пойти в абсолютно разные стороны
+        let idsLinkedContacts, idsLinkedCompanies
+        let matchingDoubleContactInFile = []
+        let matchingDoubleCompanyInFile = []
+
+        if (contacts.length > 0) {
+            matchingDoubleContactInFile = this.parseHelper.getMatchingDoubleInFile(
+                contacts,
+                doubleFieldTypeContacts,
+                doubleFieldContactsId
+            )
+
+            for (const key in matchingDoubleContactInFile) {
+                if (Number(key) !== Number(matchingDoubleContactInFile[key])) {
+                    delete contacts[key]
+                }
+            }
+
+            idsLinkedContacts = await this.parseHelper.updateOrCreateContacts(
+                contacts,
+                doubleFieldTypeContacts,
+                doubleFieldContactsId,
+                amo,
+                currentImport
+            )
+        }
+
+        if (companies.length > 0) {
+            matchingDoubleCompanyInFile = this.parseHelper.getMatchingDoubleInFile(
+                companies,
+                doubleFieldTypeCompanies,
+                doubleFieldCompaniesId
+            )
+
+            for (const key in matchingDoubleCompanyInFile) {
+                if (Number(key) !== Number(matchingDoubleCompanyInFile[key])) {
+                    delete companies[key]
+                }
+            }
+
+            idsLinkedCompanies = await this.parseHelper.updateOrCreateCompanies(
+                companies,
+                doubleFieldTypeCompanies,
+                doubleFieldCompaniesId,
+                amo,
+                currentImport
+            )
+        }
+
+        if (leads.length > 0) {
+            await this.parseHelper.createLeads(
+                leads,
+                idsLinkedContacts,
+                idsLinkedCompanies,
+                matchingDoubleContactInFile,
+                matchingDoubleCompanyInFile,
+                amo,
+                currentImport
+            )
+        }
+
+        // Связывание контактов с контактами
+        let length = 0
+        let companiesIndexes, contactsIndexes
+
+        if (idsLinkedCompanies) {
+            companiesIndexes = Object.keys(idsLinkedCompanies)
+        }
+        if (idsLinkedContacts) {
+            contactsIndexes = Object.keys(idsLinkedContacts)
+        }
+
+        if (companiesIndexes && contactsIndexes) {
+            let contactsLarger
+            if (companiesIndexes.length <= contactsIndexes.length) {
+                length = companiesIndexes.length
+                contactsLarger = true
+            } else if (companiesIndexes.length >= contactsIndexes.length) {
+                length = contactsIndexes.length
+                contactsLarger = false
+            }
+
+            let additionalIndexCompany = 0
+            let additionalIndexContact = 0
+            for (let i = 0; i < length; i++) {
+                let companyId, contactId
+                if (
+                    companiesIndexes[i + additionalIndexCompany] !==
+                    contactsIndexes[i + additionalIndexContact]
+                ) {
+                    if (contactsLarger) {
+                        additionalIndexContact++
+                    } else {
+                        additionalIndexCompany++
+                    }
+                }
+                if (
+                    companiesIndexes[i + additionalIndexCompany] ===
+                    contactsIndexes[i + additionalIndexContact]
+                ) {
+                    companyId = idsLinkedCompanies[companiesIndexes[i + additionalIndexCompany]]
+                    contactId = idsLinkedContacts[contactsIndexes[i + additionalIndexContact]]
+                }
+
+                if (companyId && contactId) {
+                    const result = await this.amocrmService.linkEntitiesMass(
+                        amo,
+                        'companies',
+                        companyId, //idsLinkedCompanies[companiesIndexes[i]],
+                        'contacts',
+                        contactId //idsLinkedContacts[contactsIndexes[i]]
+                    )
+                    await new Promise((r) => setTimeout(r, 500))
+                }
+            }
+        }
+    }
+
+    private async parseFile(currentImport: Import): Promise<any[]> {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const XLSX = require('xlsx')
+        const workBook = await XLSX.readFile(currentImport.file)
+        const sheetsArr = workBook.Sheets
+        const fieldsFromFile = []
+
+        for (const sheetKey in sheetsArr) {
+            fieldsFromFile.push(XLSX.utils.sheet_to_json(sheetsArr[sheetKey], { header: 1 }))
+        }
+
+        return fieldsFromFile
+    }
+}
